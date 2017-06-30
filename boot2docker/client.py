@@ -4,6 +4,9 @@ from typing import Dict
 from typing import Tuple
 import getpass
 
+# this is the shared folder that is by default installed on a VirtualBox.
+SHARED_FOLDER = "/Users"
+
 class VirtualBoxDriverCommands:
 
     def __init__(self, path:str=r"c:\program files\oracle\virtualbox"):
@@ -49,11 +52,12 @@ def _call_p(env, command):
 
 
 class DockerContainer:
-    def __init__(self, image_name, tag, container_name, env):
+    def __init__(self, image_name, tag, container_name, env, image: 'DockerImage'):
         self._container_name = container_name
         self._image_name = image_name
         self._tag = tag
         self._env = env
+        self._image = image
 
     def exists(self):
         return True
@@ -70,6 +74,9 @@ class DockerContainer:
         _call_p(self._env, "docker start {}".format(self._container_name))
         return self
 
+    def get_image(self):
+        return self._image
+
 
 class DockerImage:
 
@@ -85,17 +92,39 @@ class DockerImage:
         _call_p(self._env, "docker push {}".format(repo_name))
 
     def get_container(self, container_name) -> DockerContainer:
-        return DockerContainer(self._image_name, self._tag, container_name, self._env)
+        return DockerContainer(self._image_name, self._tag, container_name, self._env, self)
 
-    def run(self, volume: Tuple=None, env: Dict[str,str]=None, remove=True, port_map: Tuple=None, container_name=None,
-                    entrypoint=None) -> DockerContainer:
+    def _get_shared_folder(self, folder):
+        if SHARED_FOLDER in folder:
+            return folder
+
+        return SHARED_FOLDER + "/" + folder
+
+    def run(self, volume=None, env: Dict[str,str]=None, remove=True, port_map=None, container_name=None,
+                    entrypoint=None, restart:str="no") -> DockerContainer:
 
         args = []
         if volume is not None:
-            args.append("--volume {}:{}".format(volume[0], volume[1]))
+            if not isinstance(volume, list):
+                volume = [volume]
 
-        if port_map is not None:
-            args.append("-p {}:{}".format(port_map[0], port_map[1]))
+            for v in volume:
+                if isinstance(v, tuple):
+                    host_folder = self._get_shared_folder(v[0])
+                    machine_folder = v[1]
+                else:
+                    host_folder = SHARED_FOLDER
+                    machine_folder = v
+
+                args.append("--volume {}:{}".format(host_folder, machine_folder))
+
+        if not isinstance(port_map, list):
+            port_map = [port_map]
+
+        for m in port_map:
+            args.append("-p {}:{}".format(m[0], m[1]))
+
+        args.append("--restart {}".format(restart))
 
         if remove:
             args.append("--rm")
@@ -182,8 +211,9 @@ class DockerMachine:
         except subprocess.CalledProcessError:
             return None
 
-    def vm_create(self):
-        return self._call("docker-machine create --driver {} {}".format(self._vbox.get_driver_name(), self._vm_name))
+    def vm_create(self, memory="1024"):
+        return self._call("docker-machine create --driver {} --virtualbox-memory {} {}".format(self._vbox.get_driver_name(),
+                                                                                               memory, self._vm_name))
 
     def vm_start(self):
         return self._call("docker-machine start {}".format(self._vm_name))
@@ -228,7 +258,7 @@ class DockerMachine:
 
         return self
 
-    def create_local_env(self, local_shared_folder=None, symlinks=True):
+    def create_local_env(self, local_shared_folder=None, symlinks=True, memory=None):
 
         if self.vm_exists():
 
@@ -241,10 +271,17 @@ class DockerMachine:
             print("HOST: {}".format(self._host))
             return self
 
-        self.vm_create()
+        if memory is not None:
+            self.vm_create(memory)
+        else:
+            self.vm_create()
+
         self.set_host_name(self.get_vm_ip())
 
         if local_shared_folder is not None:
+            if not os.path.exists(local_shared_folder):
+                os.mkdir(local_shared_folder)
+
             self.vm_stop()
             self.vm_sharedfolder_create(local_shared_folder)
             if symlinks:
@@ -262,3 +299,9 @@ class DockerMachine:
             self.set_host_name(self.get_vm_tcp())
 
         return Docker(self._get_env())
+
+    def interact(self):
+        from sys import executable
+        from subprocess import Popen, CREATE_NEW_CONSOLE
+
+        Popen(executable, creationflags=CREATE_NEW_CONSOLE, shell=True)
