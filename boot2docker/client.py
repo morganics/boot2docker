@@ -50,6 +50,16 @@ def _call_p(env, command):
 
     subprocess.call([path], env=env, shell=True)
 
+def _call_with_content(env, command) -> str:
+    path = os.path.join(os.path.dirname(__file__), 'command.cmd')
+
+    # writing to file and then calling it seems to pass on admin rights... !?
+    with open(path, 'w') as fh:
+        fh.write("CALL {}".format(command))
+
+    out = subprocess.check_output([path], env=env, shell=True)
+    parts = out.decode('utf-8').split(command)
+    return parts[1].strip()
 
 class DockerContainer:
     def __init__(self, image_name, tag, container_name, env, image: 'DockerImage'):
@@ -77,6 +87,31 @@ class DockerContainer:
     def get_image(self):
         return self._image
 
+    def attach(self):
+        _call_p(self._env, "docker attach {}".format(self._container_name))
+        return DockerCommand(self._image_name, self._tag, self._container_name, self._env, self)
+
+    def execute(self, command):
+        _call_p(self._env, "docker exec {} {}".format(self._container_name, command))
+        return self
+
+class DockerCommand:
+
+    def __init__(self, image_name, tag, container_name, env, container: 'DockerContainer'):
+        self._container_name = container_name
+        self._image_name = image_name
+        self._tag = tag
+        self._env = env
+        self._container = container
+
+    def execute(self, command):
+        _call_p(self._env, command)
+        return self
+
+    def exit(self):
+        _call_p(self._env, "exit")
+        return self._container
+
 
 class DockerImage:
 
@@ -91,6 +126,10 @@ class DockerImage:
     def push(self, repo_name):
         _call_p(self._env, "docker push {}".format(repo_name))
 
+    def save(self, filename):
+        _call_p(self._env, "docker save -o {} {}".format(filename, self._image_name))
+
+
     def get_container(self, container_name) -> DockerContainer:
         return DockerContainer(self._image_name, self._tag, container_name, self._env, self)
 
@@ -101,7 +140,8 @@ class DockerImage:
         return SHARED_FOLDER + "/" + folder
 
     def run(self, volume=None, env: Dict[str,str]=None, remove=True, port_map=None, container_name=None,
-                    entrypoint=None, restart:str="no") -> DockerContainer:
+                    entrypoint=None, restart:str="no",
+                    mount:Tuple=None) -> DockerContainer:
 
         args = []
         if volume is not None:
@@ -118,11 +158,18 @@ class DockerImage:
 
                 args.append("--volume {}:{}".format(host_folder, machine_folder))
 
-        if not isinstance(port_map, list):
-            port_map = [port_map]
+        if mount is not None:
 
-        for m in port_map:
-            args.append("-p {}:{}".format(m[0], m[1]))
+            source = mount[0]
+            target = mount[1]
+            args.append("--mount source={},destination={}".format(source, target))
+
+        if port_map is not None:
+            if not isinstance(port_map, list):
+                port_map = [port_map]
+
+            for m in port_map:
+                args.append("-p {}:{}".format(m[0], m[1]))
 
         args.append("--restart {}".format(restart))
 
@@ -152,20 +199,110 @@ class DockerImage:
 
         return self.get_container(container_name)
 
+class DockerVolume:
+
+    def __init__(self, env, name):
+        self._env = env
+        self._name = name
+
+    def get_name(self):
+        return self._name
+
+    def create(self) -> 'DockerVolume':
+        _call_p(self._env, "docker volume create {}".format(self._name))
+        return self
+
+    def remove(self):
+        _call_p(self._env, "docker volume rm {}".format(self._name))
+
+    def inspect(self):
+        import json
+        try:
+            response = json.loads(_call_with_content(self._env, "docker volume inspect {}".format(self._name)))
+            return response
+        except BaseException as e:
+            print("Volume doesn't exist (probably).")
+            return None
+
+
+    def exists(self):
+        resp = self.inspect()
+        return False
+
 class Docker:
 
     def __init__(self, env):
         self._env = env
 
     def build(self, image_name, tag='latest', dir='.') -> DockerImage:
-        _call_p(self._env, "docker build -t {}:{} {}".format(image_name, tag, dir))
+        os.chdir(dir)
+        if os.path.isfile("build.py"):
+            import sys
+            sys.path.append(os.getcwd())
+            import build
+            build.build()
+
+        if os.path.isfile(".version"):
+            self._bump_minor_version(".version")
+
+        _call_p(self._env, "docker build -t {}:{} .".format(image_name, tag, dir))
         return DockerImage(self._env, image_name, tag)
+
+    def get_volume(self, volume_name) -> DockerVolume:
+        return DockerVolume(self._env, volume_name)
+
+    def _read_version(self, filename):
+        with open(filename, "rb") as fh:
+            version = fh.read().decode("utf8")
+
+        return version.split(".")
+
+    def _bump_minor_version(self, filename):
+        version = self._read_version(filename)
+        version[2] = str(int(version[2]) + 1)
+        self._write_version(filename, version)
+
+    def _write_version(self, filename, version):
+        with open(filename, "wb") as fh:
+            fh.write(".".join(version).encode("utf8"))
+
+
+    def load(self, filename, image_name, tag='latest'):
+        _call_p(self._env, "docker load -i {}".format(filename))
 
     def login(self, username, password):
         _call_p(self._env, "docker login --username={} --password={}".format(username, password))
 
+    def get_login_tokens(self,
+                         serial_number,
+                         mfa_token_code,
+                         profile='normal',
+                         mfa_profile='mfa'):
+        import json
+        response = json.loads(_call_with_content(self._env,
+                                      "aws sts get-session-token --serial-number {} --token-code {} --profile {}".
+                                      format(serial_number, mfa_token_code, profile)))
+        _call_p(self._env, "aws configure set aws_access_key_id {} --profile {}".format(response['Credentials']['AccessKeyId'], mfa_profile))
+        _call_p(self._env, "aws configure set aws_secret_access_key {} --profile {}".format(response['Credentials']['SecretAccessKey'], mfa_profile))
+        _call_p(self._env, "aws configure set aws_session_token {} --profile {}".format(response['Credentials']['SessionToken'], mfa_profile))
+
+    def login_to_aws(self, region='eu-west-1', profile='mfa'):
+        response = _call_with_content(self._env, "aws ecr get-login --no-include-email --region {} --profile {}".format(region, profile))
+        _call_p(self._env, response)
+
     def get_image(self, image_name, tag='latest') -> DockerImage:
         return DockerImage(self._env, image_name, tag)
+
+    def delete_containers(self):
+        _call_p(self._env, "FOR /f \"tokens=*\" %%i IN ('docker ps -aq') DO docker rm %%i")
+
+    def delete_images(self):
+        _call_p(self._env, "FOR /f \"tokens=*\" %%i IN ('docker images --format \"{{.ID}}\"') DO docker rmi %%i")
+
+    def cleanup(self):
+        self.delete_containers()
+        self.delete_images()
+
 
 
 class DockerMachine:
@@ -211,9 +348,9 @@ class DockerMachine:
         except subprocess.CalledProcessError:
             return None
 
-    def vm_create(self, memory="1024"):
-        return self._call("docker-machine create --driver {} --virtualbox-memory {} {}".format(self._vbox.get_driver_name(),
-                                                                                               memory, self._vm_name))
+    def vm_create(self, memory="1024", disksize=20000):
+        return self._call("docker-machine create --driver {} --virtualbox-memory {} --virtualbox-disk-size {} {}"
+                          .format(self._vbox.get_driver_name(), memory, disksize, self._vm_name))
 
     def vm_start(self):
         return self._call("docker-machine start {}".format(self._vm_name))
@@ -258,7 +395,7 @@ class DockerMachine:
 
         return self
 
-    def create_local_env(self, local_shared_folder=None, symlinks=True, memory=None):
+    def create_local_env(self, local_shared_folder=None, symlinks=True, memory=None, disksize=None):
 
         if self.vm_exists():
 
@@ -271,10 +408,13 @@ class DockerMachine:
             print("HOST: {}".format(self._host))
             return self
 
-        if memory is not None:
-            self.vm_create(memory)
-        else:
-            self.vm_create()
+        if memory is None:
+            memory = "1024"
+
+        if disksize is None:
+            disksize = "100000"
+
+        self.vm_create(memory, disksize)
 
         self.set_host_name(self.get_vm_ip())
 
